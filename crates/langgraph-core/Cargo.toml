@@ -17,9 +17,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 uuid.workspace = true
+chrono.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros"] }
+langgraph-checkpoint = { path = "../langgraph-checkpoint" }

@@ -2,6 +2,7 @@
 
 use crate::{Error, Node, Result, State};
 use dashmap::DashMap;
+use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -246,6 +247,7 @@ impl<S: State> Default for StateGraph<S> {
 }
 
 /// Compiled and validated graph ready for execution
+#[derive(Clone)]
 pub struct CompiledGraph<S: State> {
     structure: Arc<GraphStructure<S>>,
     execution_cache: Arc<DashMap<String, Vec<String>>>,
@@ -420,6 +422,339 @@ impl<S: State> CompiledGraph<S> {
     /// Get the finish point
     pub fn finish_point(&self) -> Option<&str> {
         self.structure.finish_point.as_deref()
+    }
+
+    /// Stream execution with enhanced events and configuration
+    pub async fn stream_with_config(
+        &self,
+        state: S,
+        config: crate::streaming::StreamConfig,
+    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<crate::streaming::StreamEvent<S>>> + Send>>> {
+        use crate::streaming::StreamEvent;
+        use chrono::Utc;
+        use futures::stream;
+        use std::time::Instant;
+
+        let entry = self
+            .structure
+            .entry_point
+            .as_ref()
+            .ok_or_else(|| Error::invalid_graph("No entry point"))?
+            .clone();
+
+        let structure = self.structure.clone();
+        let finish_point = self.structure.finish_point.clone();
+
+        // Emit start event
+        let start_event = StreamEvent::Started {
+            entry_node: entry.clone(),
+            timestamp: Utc::now(),
+        };
+
+        let event_stream = Box::pin(stream::once(async move { Ok(start_event) }).chain(stream::unfold(
+            (state, Some(entry), 0usize, Instant::now()),
+            move |(mut state, current_opt, step, start_time)| {
+                let structure = structure.clone();
+                let finish_point = finish_point.clone();
+                let config = config.clone();
+
+                async move {
+                    let current = current_opt?;
+
+                    // Check max steps
+                    if let Some(max_steps) = config.max_steps {
+                        if step >= max_steps {
+                            return Some((
+                                Ok(StreamEvent::Failed {
+                                    node_name: current,
+                                    error: format!("Max steps ({}) exceeded", max_steps),
+                                    timestamp: Utc::now(),
+                                }),
+                                (state, None, step, start_time),
+                            ));
+                        }
+                    }
+
+                    // Check if should emit for this node
+                    if !config.should_emit_node(&current) {
+                        // Skip this node's events but still execute it
+                        let node = structure.nodes.get(&current)?;
+                        state = node.execute(state).await.ok()?;
+
+                        let next = {
+                            let edges = structure.edges.get(&current)?;
+                            let mut next_node = None;
+                            for edge in edges {
+                                match edge {
+                                    EdgeType::Direct(to) => {
+                                        next_node = Some(to.clone());
+                                    }
+                                    EdgeType::Conditional { condition, edge_map } => {
+                                        let key = condition(&state);
+                                        if let Some(to) = edge_map.get(&key) {
+                                            next_node = Some(to.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            next_node
+                        };
+
+                        return Some((
+                            Ok(StreamEvent::NodeComplete {
+                                node_name: current,
+                                state: state.clone(),
+                                timestamp: Utc::now(),
+                                step: step + 1,
+                                duration_ms: 0,
+                            }),
+                            (state, next, step + 1, start_time),
+                        ));
+                    }
+
+                    // Track node start time
+                    let node_start_time = Instant::now();
+
+                    // Get and execute node
+                    let node = structure.nodes.get(&current)?;
+                    let execute_result = node.execute(state.clone()).await;
+
+                    match execute_result {
+                        Ok(new_state) => {
+                            state = new_state;
+                            let duration = node_start_time.elapsed().as_millis();
+
+                            // Check if we've reached the finish point
+                            let is_finish = if let Some(finish) = &finish_point {
+                                &current == finish
+                            } else {
+                                false
+                            };
+
+                            if is_finish {
+                                let total_duration = start_time.elapsed().as_millis();
+                                let complete_event = StreamEvent::Completed {
+                                    final_node: current,
+                                    state: state.clone(),
+                                    timestamp: Utc::now(),
+                                    total_steps: step + 1,
+                                    total_duration_ms: total_duration,
+                                };
+                                Some((Ok(complete_event), (state, None, step + 1, start_time)))
+                            } else {
+                                // Determine next node
+                                let next = {
+                                    let edges = structure.edges.get(&current)?;
+                                    let mut next_node = None;
+
+                                    for edge in edges {
+                                        match edge {
+                                            EdgeType::Direct(to) => {
+                                                next_node = Some(to.clone());
+                                            }
+                                            EdgeType::Conditional { condition, edge_map } => {
+                                                let key = condition(&state);
+                                                if let Some(to) = edge_map.get(&key) {
+                                                    next_node = Some(to.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    next_node
+                                };
+
+                                let complete_event = StreamEvent::NodeComplete {
+                                    node_name: current,
+                                    state: state.clone(),
+                                    timestamp: Utc::now(),
+                                    step: step + 1,
+                                    duration_ms: duration,
+                                };
+
+                                Some((Ok(complete_event), (state, next, step + 1, start_time)))
+                            }
+                        }
+                        Err(e) => {
+                            let error_event = StreamEvent::NodeError {
+                                node_name: current,
+                                error: e.to_string(),
+                                timestamp: Utc::now(),
+                                step: step + 1,
+                            };
+                            Some((Ok(error_event), (state, None, step + 1, start_time)))
+                        }
+                    }
+                }
+            },
+        )));
+
+        Ok(event_stream)
+    }
+
+    /// Replay execution from a checkpoint
+    ///
+    /// This method loads state from a checkpoint and continues execution from that point.
+    /// The checkpointer must implement the `CheckpointLoader` trait from the replay module.
+    pub async fn replay_from_checkpoint<C: crate::replay::CheckpointLoader<S>>(
+        &self,
+        checkpointer: &C,
+        checkpoint_id: &str,
+        config: crate::replay::ReplayConfig,
+    ) -> Result<S> {
+        use crate::replay::TimeTravelDebugger;
+
+        // Load the checkpoint
+        let state = TimeTravelDebugger::get_state_at(checkpointer, checkpoint_id).await?;
+
+        // Execute from this state
+        let execution_config = ExecutionConfig {
+            max_steps: config.max_steps,
+            debug: config.debug,
+        };
+
+        self.execute_with_config(state, execution_config).await
+    }
+
+    /// Execute with human-in-the-loop support
+    pub async fn execute_with_interrupt(
+        &self,
+        state: S,
+        config: ExecutionConfig,
+        interrupt_handler: crate::interrupt::InterruptHandler<S>,
+    ) -> Result<S> {
+        use crate::interrupt::{InterruptEvent, InterruptResponse, InterruptSignal};
+        use chrono::Utc;
+
+        let entry = self
+            .structure
+            .entry_point
+            .as_ref()
+            .ok_or_else(|| Error::invalid_graph("No entry point"))?;
+
+        let mut current = entry.clone();
+        let mut state = state;
+        let mut visited = std::collections::HashSet::new();
+        let mut step_count = 0;
+
+        loop {
+            // Check max steps
+            if let Some(max_steps) = config.max_steps {
+                if step_count >= max_steps {
+                    return Err(Error::invalid_operation(format!(
+                        "Max steps ({}) exceeded",
+                        max_steps
+                    )));
+                }
+            }
+
+            // Check for interrupt before node
+            if interrupt_handler.should_interrupt_before(&current).await {
+                // Check for approval requirement
+                if let Some(approval_config) = interrupt_handler.get_approval_config(&current).await {
+                    let event = InterruptEvent::new(
+                        current.clone(),
+                        state.clone(),
+                        InterruptSignal::ApprovalRequired {
+                            node_name: current.clone(),
+                            prompt: approval_config.prompt.clone(),
+                            options: approval_config.options.clone(),
+                        },
+                    );
+
+                    interrupt_handler.send_interrupt(event).await?;
+                    let response = interrupt_handler.wait_for_response().await?;
+
+                    match response {
+                        InterruptResponse::Approved { .. } => {
+                            // Continue execution
+                        }
+                        InterruptResponse::Rejected { reason } => {
+                            return Err(Error::invalid_operation(format!(
+                                "Execution rejected: {}",
+                                reason
+                            )));
+                        }
+                        InterruptResponse::ModifyState { modifications } => {
+                            // Apply state modifications
+                            // Note: Full JSON patch implementation would go here
+                            if config.debug {
+                                eprintln!("State modifications requested: {} changes", modifications.len());
+                            }
+                        }
+                        InterruptResponse::Continue => {
+                            // Continue without changes
+                        }
+                    }
+                } else {
+                    // Regular pause
+                    let event = InterruptEvent::new(
+                        current.clone(),
+                        state.clone(),
+                        InterruptSignal::PauseBefore {
+                            node_name: current.clone(),
+                            reason: "Configured pause point".to_string(),
+                        },
+                    );
+
+                    interrupt_handler.send_interrupt(event).await?;
+                    let _response = interrupt_handler.wait_for_response().await?;
+                }
+            }
+
+            // Mark as visited
+            visited.insert(current.clone());
+            step_count += 1;
+
+            // Get the node
+            let node = self
+                .structure
+                .nodes
+                .get(&current)
+                .ok_or_else(|| Error::node_not_found(&current))?;
+
+            // Execute the node
+            state = node
+                .execute(state)
+                .await
+                .map_err(|e| Error::node_execution_failed(format!("Node '{}': {}", current, e)))?;
+
+            // Check for interrupt after node
+            if interrupt_handler.should_interrupt_after(&current).await {
+                let event = InterruptEvent::new(
+                    current.clone(),
+                    state.clone(),
+                    InterruptSignal::PauseAfter {
+                        node_name: current.clone(),
+                        reason: "Configured pause point".to_string(),
+                    },
+                );
+
+                interrupt_handler.send_interrupt(event).await?;
+                let _response = interrupt_handler.wait_for_response().await?;
+            }
+
+            // Check if we've reached the finish point
+            if let Some(finish) = &self.structure.finish_point {
+                if &current == finish {
+                    break;
+                }
+            }
+
+            // Determine next node
+            let next = self.get_next_node(&current, &state)?;
+
+            match next {
+                Some(next_node) => {
+                    current = next_node;
+                }
+                None => {
+                    // No more nodes to execute
+                    break;
+                }
+            }
+        }
+
+        Ok(state)
     }
 }
 
