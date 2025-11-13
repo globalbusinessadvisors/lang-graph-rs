@@ -238,6 +238,11 @@ impl<S: State> Checkpointer<S> for AgentDbCheckpointer {
                     thread_id,
                     parent_id,
                     created_at,
+                    execution_status: langgraph_core::ExecutionStatus::Running,
+                    node_name: None,
+                    execution_duration_ms: None,
+                    error: None,
+                    next_node: None,
                     extra,
                 },
                 state,
@@ -307,6 +312,11 @@ impl<S: State> Checkpointer<S> for AgentDbCheckpointer {
                 thread_id,
                 parent_id,
                 created_at,
+                execution_status: langgraph_core::ExecutionStatus::Running,
+                node_name: None,
+                execution_duration_ms: None,
+                error: None,
+                next_node: None,
                 extra,
             });
         }
@@ -358,6 +368,11 @@ impl<S: State> Checkpointer<S> for AgentDbCheckpointer {
                 thread_id,
                 parent_id,
                 created_at,
+                execution_status: langgraph_core::ExecutionStatus::Running,
+                node_name: None,
+                execution_duration_ms: None,
+                error: None,
+                next_node: None,
                 extra,
             });
         }

@@ -13,6 +13,7 @@ pub mod memory;
 pub mod sqlite;
 
 pub use checkpointer::{Checkpoint, CheckpointMetadata, Checkpointer};
+pub use langgraph_core::ExecutionStatus;
 pub use memory::MemoryCheckpointer;
 
 #[cfg(feature = "sqlite")]
@@ -20,7 +21,10 @@ pub use sqlite::SqliteCheckpointer;
 
 /// Prelude module for convenient imports
 pub mod prelude {
-    pub use crate::{Checkpoint, CheckpointMetadata, Checkpointer, MemoryCheckpointer};
+    pub use crate::{
+        Checkpoint, CheckpointMetadata, Checkpointer, ExecutionStatus,
+        MemoryCheckpointer,
+    };
 
     #[cfg(feature = "sqlite")]
     pub use crate::SqliteCheckpointer;

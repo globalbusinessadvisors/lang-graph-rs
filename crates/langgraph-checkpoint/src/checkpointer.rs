@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use langgraph_core::{Result, State};
+use langgraph_core::{ExecutionStatus, Result, State};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -18,6 +18,17 @@ pub struct CheckpointMetadata {
     pub parent_id: Option<String>,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
+    /// Execution status (for time travel debugging and human-in-the-loop)
+    #[serde(default)]
+    pub execution_status: ExecutionStatus,
+    /// Node name that was executed (for time travel debugging)
+    pub node_name: Option<String>,
+    /// Execution duration in milliseconds (for time travel debugging)
+    pub execution_duration_ms: Option<u64>,
+    /// Error message if execution failed (for time travel debugging)
+    pub error: Option<String>,
+    /// Next node to execute (for interrupted execution)
+    pub next_node: Option<String>,
     /// Custom metadata
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -31,6 +42,11 @@ impl CheckpointMetadata {
             thread_id: thread_id.into(),
             parent_id: None,
             created_at: Utc::now(),
+            execution_status: ExecutionStatus::Running,
+            node_name: None,
+            execution_duration_ms: None,
+            error: None,
+            next_node: None,
             extra: HashMap::new(),
         }
     }
@@ -42,6 +58,11 @@ impl CheckpointMetadata {
             thread_id: thread_id.into(),
             parent_id: Some(parent_id.into()),
             created_at: Utc::now(),
+            execution_status: ExecutionStatus::Running,
+            node_name: None,
+            execution_duration_ms: None,
+            error: None,
+            next_node: None,
             extra: HashMap::new(),
         }
     }
@@ -49,6 +70,37 @@ impl CheckpointMetadata {
     /// Add custom metadata
     pub fn with_metadata(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
         self.extra.insert(key.into(), value);
+        self
+    }
+
+    /// Set execution status
+    pub fn with_status(mut self, status: ExecutionStatus) -> Self {
+        self.execution_status = status;
+        self
+    }
+
+    /// Set node name
+    pub fn with_node_name(mut self, node_name: impl Into<String>) -> Self {
+        self.node_name = Some(node_name.into());
+        self
+    }
+
+    /// Set execution duration
+    pub fn with_duration(mut self, duration_ms: u64) -> Self {
+        self.execution_duration_ms = Some(duration_ms);
+        self
+    }
+
+    /// Set error message
+    pub fn with_error(mut self, error: impl Into<String>) -> Self {
+        self.error = Some(error.into());
+        self.execution_status = ExecutionStatus::Failed;
+        self
+    }
+
+    /// Set next node (for interrupted execution)
+    pub fn with_next_node(mut self, next_node: impl Into<String>) -> Self {
+        self.next_node = Some(next_node.into());
         self
     }
 }

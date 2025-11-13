@@ -12,7 +12,7 @@ pub mod schema;
 pub mod state;
 
 pub use error::{Error, Result};
-pub use graph::{CompiledGraph, StateGraph};
+pub use graph::{CompiledGraph, ExecutionConfig, ExecutionStatus, InterruptedExecution, ResumeToken, StateGraph, StreamConfig, StreamEvent};
 pub use message::{Message, MessageGraph};
 pub use node::Node;
 pub use reducer::Reducer;
@@ -22,7 +22,8 @@ pub use state::State;
 /// Prelude module for convenient imports
 pub mod prelude {
     pub use crate::{
-        CompiledGraph, Error, Message, MessageGraph, Node, Reducer, Result, State, StateGraph,
-        StateSchema,
+        CompiledGraph, Error, ExecutionConfig, ExecutionStatus,
+        InterruptedExecution, Message, MessageGraph, Node, Reducer,
+        Result, ResumeToken, State, StateGraph, StateSchema, StreamConfig, StreamEvent,
     };
 }
