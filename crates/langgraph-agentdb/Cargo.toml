@@ -1,0 +1,27 @@
+[package]
+name = "langgraph-agentdb"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "AgentDB-specific checkpointing for LangGraph"
+
+[dependencies]
+langgraph-core = { path = "../langgraph-core" }
+langgraph-checkpoint = { path = "../langgraph-checkpoint" }
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+rusqlite = { workspace = true, features = ["bundled", "vtab"] }
+ndarray.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
