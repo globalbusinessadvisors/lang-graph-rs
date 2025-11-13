@@ -16,6 +16,8 @@ Enterprise-grade, production-ready port of LangGraph to Rust with WebAssembly su
 - **Vector Indexing**: HNSW-based semantic search with 384-dim embeddings
 - **Sub-millisecond Saves**: AgentDB checkpointer achieves <1ms checkpoint saves
 - **Streaming Execution**: Real-time state updates via async streams
+- **Human-in-the-Loop**: Interactive execution with breakpoints and state inspection
+- **Execution Tracing**: Complete history tracking of node execution paths
 - **Lock-Free Concurrency**: DashMap-based concurrent access patterns
 - **Smart Cycle Detection**: Prevents infinite loops while allowing conditional recursion
 - **Configurable Safety Limits**: Max execution steps and timeout controls
@@ -288,6 +290,79 @@ while let Some(result) = stream.next().await {
 }
 ```
 
+### Human-in-the-Loop (Interactive Execution)
+
+Pause execution at strategic points to allow human intervention, state inspection, and flow control:
+
+```rust
+use langgraph_core::prelude::*;
+
+// Configure breakpoints before specific nodes
+let config = InteractiveConfig::with_breakpoints_before(vec!["review", "approve"]);
+
+// Start interactive execution
+let (mut handle, execution_task) = graph.execute_interactive(state, config).await?;
+
+// Handle interaction points in a separate task
+tokio::spawn(async move {
+    while let Some((point, state)) = handle.wait_for_interaction().await {
+        println!("⏸️  Paused at node: {}", point.node_name);
+        println!("   State: {:?}", state);
+
+        // Option 1: Continue with current state
+        handle.continue_execution()?;
+
+        // Option 2: Modify state before continuing
+        // let mut modified = state.clone();
+        // modified.priority = 10;
+        // handle.continue_with(modified)?;
+
+        // Option 3: Skip current node
+        // handle.skip()?;
+
+        // Option 4: Abort execution
+        // handle.abort("User cancelled")?;
+    }
+});
+
+// Wait for execution to complete
+let final_state = execution_task.await.unwrap()?;
+```
+
+**Advanced Interactive Configurations:**
+
+```rust
+// Breakpoints after node execution
+let config = InteractiveConfig::with_breakpoints_after(vec!["process"]);
+
+// Multiple strategies
+let config = InteractiveConfig::default()
+    .with_strategy(InterruptStrategy::BeforeNodes(nodes))
+    .with_strategy(InterruptStrategy::EveryNSteps(5))
+    .with_strategy(InterruptStrategy::OnError)
+    .with_max_steps(100);
+
+// With execution tracing
+let trace = handle.trace().await;
+println!("Steps: {}, Nodes: {:?}", trace.total_steps, trace.node_sequence());
+```
+
+**Interrupt Strategies:**
+- `BeforeNodes` - Pause before executing specific nodes
+- `AfterNodes` - Pause after executing specific nodes
+- `BeforeAndAfterNodes` - Pause both before and after
+- `OnError` - Pause when a node execution fails
+- `EveryNSteps` - Pause at regular intervals
+
+**Interaction Responses:**
+- `continue_execution()` - Continue with current state
+- `continue_with(state)` - Continue with modified state
+- `skip()` - Skip current node and move to next
+- `abort(reason)` - Abort execution with reason
+- `resume_at(node)` - Jump to a different node
+
+See the [human-in-the-loop example](./crates/langgraph-core/examples/human_in_the_loop.rs) for comprehensive usage patterns.
+
 ### Execution Configuration
 
 Control graph execution with safety limits:
@@ -449,7 +524,7 @@ This implementation targets 100% API compatibility with LangGraph Python, with t
 - ✅ Streaming execution
 - ✅ Checkpoint pagination
 - ✅ Metadata search
-- ⚠️ Human-in-the-loop (pending)
+- ✅ Human-in-the-loop (interactive execution)
 - ⚠️ Time travel debugging (pending)
 
 ## 🤝 Contributing

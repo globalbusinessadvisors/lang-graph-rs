@@ -5,6 +5,7 @@
 
 pub mod error;
 pub mod graph;
+pub mod interactive;
 pub mod message;
 pub mod node;
 pub mod reducer;
@@ -13,6 +14,10 @@ pub mod state;
 
 pub use error::{Error, Result};
 pub use graph::{CompiledGraph, StateGraph};
+pub use interactive::{
+    ExecutionHandle, ExecutionTrace, InteractionPoint, InteractionResponse, InteractiveConfig,
+    InterruptStrategy,
+};
 pub use message::{Message, MessageGraph};
 pub use node::Node;
 pub use reducer::Reducer;
@@ -22,7 +27,8 @@ pub use state::State;
 /// Prelude module for convenient imports
 pub mod prelude {
     pub use crate::{
-        CompiledGraph, Error, Message, MessageGraph, Node, Reducer, Result, State, StateGraph,
-        StateSchema,
+        CompiledGraph, Error, ExecutionHandle, ExecutionTrace, InteractionPoint,
+        InteractionResponse, InteractiveConfig, InterruptStrategy, Message, MessageGraph, Node,
+        Reducer, Result, State, StateGraph, StateSchema,
     };
 }

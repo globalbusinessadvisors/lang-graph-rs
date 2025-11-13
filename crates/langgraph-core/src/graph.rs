@@ -1,9 +1,14 @@
 //! Graph execution engine - StateGraph and CompiledGraph
 
+use crate::interactive::{
+    ExecutionEvent, ExecutionHandle, InteractionPosition, InteractionResponse, InteractiveConfig,
+    InteractiveState, InterruptReason,
+};
 use crate::{Error, Node, Result, State};
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
 
 /// Edge type in the graph
 enum EdgeType<S: State> {
@@ -420,6 +425,268 @@ impl<S: State> CompiledGraph<S> {
     /// Get the finish point
     pub fn finish_point(&self) -> Option<&str> {
         self.structure.finish_point.as_deref()
+    }
+
+    /// Execute the graph with interactive human-in-the-loop support
+    ///
+    /// This method allows execution to be paused at specified breakpoints,
+    /// enabling human intervention to inspect state, modify it, or control flow.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use langgraph_core::interactive::InteractiveConfig;
+    ///
+    /// let config = InteractiveConfig::with_breakpoints_before(vec!["review_node"]);
+    /// let (handle, result_rx) = graph.execute_interactive(state, config).await?;
+    ///
+    /// // In a separate task or thread
+    /// tokio::spawn(async move {
+    ///     while let Some((point, state)) = handle.wait_for_interaction().await {
+    ///         println!("Paused at: {:?}", point);
+    ///         // Modify state or just continue
+    ///         handle.continue_execution().unwrap();
+    ///     }
+    /// });
+    ///
+    /// let final_state = result_rx.await.unwrap()?;
+    /// ```
+    pub async fn execute_interactive(
+        &self,
+        state: S,
+        config: InteractiveConfig,
+    ) -> Result<(ExecutionHandle<S>, tokio::task::JoinHandle<Result<S>>)> {
+        let (interaction_tx, interaction_rx) = mpsc::unbounded_channel();
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
+        let trace = Arc::new(RwLock::new(crate::interactive::ExecutionTrace::new()));
+
+        let handle = ExecutionHandle::new(interaction_rx, response_tx, trace.clone());
+
+        let mut interactive_state = InteractiveState {
+            interaction_tx,
+            response_rx,
+            trace: trace.clone(),
+            config: config.clone(),
+            step_count: 0,
+        };
+
+        let self_clone = self.clone();
+        let execution_task = tokio::spawn(async move {
+            self_clone
+                .execute_interactive_impl(state, &mut interactive_state)
+                .await
+        });
+
+        Ok((handle, execution_task))
+    }
+
+    /// Internal implementation of interactive execution
+    async fn execute_interactive_impl(
+        &self,
+        mut state: S,
+        interactive: &mut InteractiveState<S>,
+    ) -> Result<S> {
+        let entry = self
+            .structure
+            .entry_point
+            .as_ref()
+            .ok_or_else(|| Error::invalid_graph("No entry point"))?;
+
+        let mut current = entry.clone();
+        let mut visited = HashSet::new();
+
+        loop {
+            // Check max steps
+            if let Some(max_steps) = interactive.config.max_steps {
+                if interactive.step_count >= max_steps {
+                    return Err(Error::invalid_operation(format!(
+                        "Max steps ({}) exceeded",
+                        max_steps
+                    )));
+                }
+            }
+
+            visited.insert(current.clone());
+            interactive.step_count += 1;
+
+            // Check for interruption before node execution
+            if let Some(reason) =
+                interactive.should_interrupt(&current, InteractionPosition::Before)
+            {
+                let response = interactive
+                    .interact(
+                        current.clone(),
+                        InteractionPosition::Before,
+                        state.clone(),
+                        reason,
+                    )
+                    .await?;
+
+                match response {
+                    InteractionResponse::Continue => {}
+                    InteractionResponse::ContinueWith(new_state) => {
+                        state = new_state;
+                    }
+                    InteractionResponse::Skip => {
+                        // Skip this node, move to next
+                        if let Some(next) = self.get_next_node(&current, &state)? {
+                            current = next;
+                            continue;
+                        } else {
+                            break;
+                        }
+                    }
+                    InteractionResponse::Abort(reason) => {
+                        return Err(Error::invalid_operation(format!(
+                            "Execution aborted: {}",
+                            reason
+                        )));
+                    }
+                    InteractionResponse::ResumeAt(node) => {
+                        current = node;
+                        continue;
+                    }
+                }
+            }
+
+            // Get and execute the node
+            let node = self
+                .structure
+                .nodes
+                .get(&current)
+                .ok_or_else(|| Error::node_not_found(&current))?;
+
+            let node_name = current.clone();
+            let execution_result = node.execute(state.clone()).await;
+
+            // Record execution event
+            let event = match &execution_result {
+                Ok(_) => ExecutionEvent {
+                    node_name: node_name.clone(),
+                    step: interactive.step_count,
+                    timestamp: std::time::SystemTime::now(),
+                    success: true,
+                    error: None,
+                },
+                Err(e) => ExecutionEvent {
+                    node_name: node_name.clone(),
+                    step: interactive.step_count,
+                    timestamp: std::time::SystemTime::now(),
+                    success: false,
+                    error: Some(e.to_string()),
+                },
+            };
+
+            interactive.record_event(event).await;
+
+            // Handle execution result
+            match execution_result {
+                Ok(new_state) => {
+                    state = new_state;
+                }
+                Err(e) => {
+                    // Check if we should interrupt on error
+                    if interactive
+                        .config
+                        .strategies
+                        .iter()
+                        .any(|s| matches!(s, crate::interactive::InterruptStrategy::OnError))
+                    {
+                        let response = interactive
+                            .interact(
+                                node_name.clone(),
+                                InteractionPosition::After,
+                                state.clone(),
+                                InterruptReason::Error(e.to_string()),
+                            )
+                            .await?;
+
+                        match response {
+                            InteractionResponse::Continue => {
+                                // Continue despite error
+                            }
+                            InteractionResponse::ContinueWith(new_state) => {
+                                state = new_state;
+                            }
+                            InteractionResponse::Abort(reason) => {
+                                return Err(Error::invalid_operation(format!(
+                                    "Execution aborted: {}",
+                                    reason
+                                )));
+                            }
+                            _ => {
+                                return Err(e);
+                            }
+                        }
+                    } else {
+                        return Err(Error::node_execution_failed(format!(
+                            "Node '{}': {}",
+                            node_name, e
+                        )));
+                    }
+                }
+            }
+
+            // Check for interruption after node execution
+            if let Some(reason) = interactive.should_interrupt(&current, InteractionPosition::After)
+            {
+                let response = interactive
+                    .interact(current.clone(), InteractionPosition::After, state.clone(), reason)
+                    .await?;
+
+                match response {
+                    InteractionResponse::Continue => {}
+                    InteractionResponse::ContinueWith(new_state) => {
+                        state = new_state;
+                    }
+                    InteractionResponse::Skip => {}
+                    InteractionResponse::Abort(reason) => {
+                        return Err(Error::invalid_operation(format!(
+                            "Execution aborted: {}",
+                            reason
+                        )));
+                    }
+                    InteractionResponse::ResumeAt(node) => {
+                        current = node;
+                        continue;
+                    }
+                }
+            }
+
+            // Check if we've reached the finish point
+            if let Some(finish) = &self.structure.finish_point {
+                if &current == finish {
+                    break;
+                }
+            }
+
+            // Determine next node
+            let next = self.get_next_node(&current, &state)?;
+
+            match next {
+                Some(next_node) => {
+                    current = next_node;
+                }
+                None => {
+                    break;
+                }
+            }
+        }
+
+        // Mark trace as complete
+        let mut trace = interactive.trace.write().await;
+        trace.complete();
+
+        Ok(state)
+    }
+}
+
+impl<S: State> Clone for CompiledGraph<S> {
+    fn clone(&self) -> Self {
+        Self {
+            structure: self.structure.clone(),
+            execution_cache: self.execution_cache.clone(),
+        }
     }
 }
 
