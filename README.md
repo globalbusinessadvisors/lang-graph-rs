@@ -93,7 +93,7 @@ WebAssembly bindings for browser and Node.js deployment.
 
 ### Core Traits
 
-**Node<S>**: Async node execution interface
+**`Node<S>`**: Async node execution interface
 ```rust
 #[async_trait]
 pub trait Node<S>: Send + Sync + Debug
@@ -114,7 +114,7 @@ pub trait StateSchema: Send + Sync {
 }
 ```
 
-**Reducer<T>**: State aggregation logic
+**`Reducer<T>`**: State aggregation logic
 ```rust
 pub trait Reducer<T>: Send + Sync + Debug
 where
@@ -124,7 +124,7 @@ where
 }
 ```
 
-**Checkpointer<S>**: Async persistence operations
+**`Checkpointer<S>`**: Async persistence operations
 ```rust
 #[async_trait]
 pub trait Checkpointer<S>: Send + Sync
