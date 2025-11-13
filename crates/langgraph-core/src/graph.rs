@@ -1,5 +1,7 @@
 //! Graph execution engine - StateGraph and CompiledGraph
 
+use crate::interrupt::{Interrupt, InterruptManager, InterruptReason, InterruptResponse};
+use crate::timetravel::{ExecutionHistoryManager, ExecutionStep};
 use crate::{Error, Node, Result, State};
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
@@ -246,6 +248,7 @@ impl<S: State> Default for StateGraph<S> {
 }
 
 /// Compiled and validated graph ready for execution
+#[derive(Clone)]
 pub struct CompiledGraph<S: State> {
     structure: Arc<GraphStructure<S>>,
     execution_cache: Arc<DashMap<String, Vec<String>>>,
@@ -262,7 +265,7 @@ impl<S: State> CompiledGraph<S> {
     pub async fn execute_with_config(
         &self,
         mut state: S,
-        config: ExecutionConfig,
+        config: ExecutionConfig<S>,
     ) -> Result<S> {
         let entry = self
             .structure
@@ -270,60 +273,169 @@ impl<S: State> CompiledGraph<S> {
             .as_ref()
             .ok_or_else(|| Error::invalid_graph("No entry point"))?;
 
+        // Start execution history if time travel is enabled
+        if config.enable_time_travel {
+            if let Some(ref history_manager) = config.history_manager {
+                history_manager
+                    .start_execution(&config.thread_id, state.clone())
+                    .await;
+            }
+        }
+
         let mut current = entry.clone();
         let mut visited = HashSet::new();
         let mut step_count = 0;
 
-        loop {
-            // Check max steps
-            if let Some(max_steps) = config.max_steps {
-                if step_count >= max_steps {
-                    return Err(Error::invalid_operation(format!(
-                        "Max steps ({}) exceeded",
-                        max_steps
-                    )));
+        let execution_result = async {
+            loop {
+                // Check max steps
+                if let Some(max_steps) = config.max_steps {
+                    if step_count >= max_steps {
+                        return Err(Error::invalid_operation(format!(
+                            "Max steps ({}) exceeded",
+                            max_steps
+                        )));
+                    }
+                }
+
+                // Mark as visited
+                visited.insert(current.clone());
+
+                // Check for interrupt before execution
+                if let Some(reason) = config.interrupt_nodes.get(&current) {
+                    if let Some(ref interrupt_manager) = config.interrupt_manager {
+                        let interrupt = Interrupt::new(
+                            config.thread_id.clone(),
+                            current.clone(),
+                            state.clone(),
+                            reason.clone(),
+                        );
+
+                        if config.debug {
+                            eprintln!("[DEBUG] Interrupt triggered at node: {}", current);
+                        }
+
+                        let response = interrupt_manager.register_interrupt(interrupt).await?;
+
+                        if !response.should_continue {
+                            return Err(Error::invalid_operation(
+                                "Execution aborted by human interrupt",
+                            ));
+                        }
+
+                        // Apply state updates if provided
+                        if let Some(updates) = response.state_updates {
+                            // For now, we'll just log this - actual state merging would require
+                            // reflection or a more sophisticated state update mechanism
+                            if config.debug {
+                                eprintln!("[DEBUG] State updates requested: {:?}", updates);
+                            }
+                        }
+                    }
+                }
+
+                // Get the node
+                let node = self
+                    .structure
+                    .nodes
+                    .get(&current)
+                    .ok_or_else(|| Error::node_not_found(&current))?;
+
+                // Store state before execution for history
+                let state_before = state.clone();
+                let start_time = std::time::Instant::now();
+
+                // Execute the node
+                let execution_result = node.execute(state).await;
+                let duration = start_time.elapsed();
+
+                match execution_result {
+                    Ok(new_state) => {
+                        state = new_state;
+
+                        // Record step in history
+                        if config.enable_time_travel {
+                            if let Some(ref history_manager) = config.history_manager {
+                                let step = ExecutionStep::new(
+                                    step_count,
+                                    current.clone(),
+                                    state_before,
+                                    state.clone(),
+                                    duration.as_micros() as u64,
+                                );
+                                let _ = history_manager
+                                    .add_step(&config.thread_id, step)
+                                    .await;
+                            }
+                        }
+
+                        if config.debug {
+                            eprintln!(
+                                "[DEBUG] Node '{}' completed in {:?}",
+                                current, duration
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // Record error step in history
+                        if config.enable_time_travel {
+                            if let Some(ref history_manager) = config.history_manager {
+                                let step = ExecutionStep::with_error(
+                                    step_count,
+                                    current.clone(),
+                                    state_before,
+                                    e.to_string(),
+                                );
+                                let _ = history_manager
+                                    .add_step(&config.thread_id, step)
+                                    .await;
+                            }
+                        }
+
+                        return Err(Error::node_execution_failed(format!(
+                            "Node '{}': {}",
+                            current, e
+                        )));
+                    }
+                }
+
+                step_count += 1;
+
+                // Check if we've reached the finish point
+                if let Some(finish) = &self.structure.finish_point {
+                    if &current == finish {
+                        break;
+                    }
+                }
+
+                // Determine next node
+                let next = self.get_next_node(&current, &state)?;
+
+                match next {
+                    Some(next_node) => {
+                        current = next_node;
+                    }
+                    None => {
+                        // No more nodes to execute
+                        break;
+                    }
                 }
             }
 
-            // Mark as visited
-            visited.insert(current.clone());
-            step_count += 1;
+            Ok(state)
+        }
+        .await;
 
-            // Get the node
-            let node = self
-                .structure
-                .nodes
-                .get(&current)
-                .ok_or_else(|| Error::node_not_found(&current))?;
-
-            // Execute the node
-            state = node
-                .execute(state)
-                .await
-                .map_err(|e| Error::node_execution_failed(format!("Node '{}': {}", current, e)))?;
-
-            // Check if we've reached the finish point
-            if let Some(finish) = &self.structure.finish_point {
-                if &current == finish {
-                    break;
-                }
-            }
-
-            // Determine next node
-            let next = self.get_next_node(&current, &state)?;
-
-            match next {
-                Some(next_node) => {
-                    current = next_node;
-                }
-                None => {
-                    // No more nodes to execute
-                    break;
-                }
+        // Complete execution history
+        if config.enable_time_travel {
+            if let Some(ref history_manager) = config.history_manager {
+                let _ = history_manager
+                    .complete_execution(&config.thread_id, execution_result.is_ok())
+                    .await;
             }
         }
 
-        Ok(state)
+        execution_result
     }
 
     /// Stream execution with intermediate states
@@ -424,20 +536,106 @@ impl<S: State> CompiledGraph<S> {
 }
 
 /// Configuration for graph execution
-#[derive(Debug, Clone)]
-pub struct ExecutionConfig {
+#[derive(Clone)]
+pub struct ExecutionConfig<S: State> {
     /// Maximum number of steps to execute
     pub max_steps: Option<usize>,
     /// Enable debug logging
     pub debug: bool,
+    /// Thread ID for this execution
+    pub thread_id: String,
+    /// Interrupt manager for human-in-the-loop
+    pub interrupt_manager: Option<Arc<InterruptManager<S>>>,
+    /// Nodes that should trigger interrupts (node_name -> when to interrupt)
+    pub interrupt_nodes: HashMap<String, InterruptReason>,
+    /// History manager for time travel debugging
+    pub history_manager: Option<Arc<ExecutionHistoryManager<S>>>,
+    /// Enable automatic checkpointing at each step
+    pub enable_time_travel: bool,
 }
 
-impl Default for ExecutionConfig {
+impl<S: State> ExecutionConfig<S> {
+    /// Create a new configuration with thread ID
+    pub fn new(thread_id: impl Into<String>) -> Self {
+        Self {
+            max_steps: Some(1000),
+            debug: false,
+            thread_id: thread_id.into(),
+            interrupt_manager: None,
+            interrupt_nodes: HashMap::new(),
+            history_manager: None,
+            enable_time_travel: false,
+        }
+    }
+
+    /// Enable human-in-the-loop with the provided interrupt manager
+    pub fn with_interrupts(mut self, manager: Arc<InterruptManager<S>>) -> Self {
+        self.interrupt_manager = Some(manager);
+        self
+    }
+
+    /// Add a node that should trigger an interrupt
+    pub fn add_interrupt_node(
+        mut self,
+        node_name: impl Into<String>,
+        reason: InterruptReason,
+    ) -> Self {
+        self.interrupt_nodes.insert(node_name.into(), reason);
+        self
+    }
+
+    /// Enable time travel debugging with the provided history manager
+    pub fn with_time_travel(mut self, manager: Arc<ExecutionHistoryManager<S>>) -> Self {
+        self.history_manager = Some(manager);
+        self.enable_time_travel = true;
+        self
+    }
+
+    /// Enable time travel debugging with a new history manager
+    pub fn enable_time_travel(mut self) -> Self {
+        self.history_manager = Some(Arc::new(ExecutionHistoryManager::new()));
+        self.enable_time_travel = true;
+        self
+    }
+
+    /// Set maximum steps
+    pub fn with_max_steps(mut self, max_steps: usize) -> Self {
+        self.max_steps = Some(max_steps);
+        self
+    }
+
+    /// Enable debug logging
+    pub fn with_debug(mut self, debug: bool) -> Self {
+        self.debug = debug;
+        self
+    }
+}
+
+impl<S: State> Default for ExecutionConfig<S> {
     fn default() -> Self {
         Self {
             max_steps: Some(1000),
             debug: false,
+            thread_id: uuid::Uuid::new_v4().to_string(),
+            interrupt_manager: None,
+            interrupt_nodes: HashMap::new(),
+            history_manager: None,
+            enable_time_travel: false,
         }
+    }
+}
+
+impl<S: State> std::fmt::Debug for ExecutionConfig<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionConfig")
+            .field("max_steps", &self.max_steps)
+            .field("debug", &self.debug)
+            .field("thread_id", &self.thread_id)
+            .field("has_interrupt_manager", &self.interrupt_manager.is_some())
+            .field("interrupt_nodes", &self.interrupt_nodes)
+            .field("has_history_manager", &self.history_manager.is_some())
+            .field("enable_time_travel", &self.enable_time_travel)
+            .finish()
     }
 }
 

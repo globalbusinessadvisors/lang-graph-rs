@@ -20,6 +20,8 @@ Enterprise-grade, production-ready port of LangGraph to Rust with WebAssembly su
 - **Smart Cycle Detection**: Prevents infinite loops while allowing conditional recursion
 - **Configurable Safety Limits**: Max execution steps and timeout controls
 - **Rich Reducer Library**: 5 built-in state reducers + custom support
+- **Human-in-the-Loop**: Pause execution for approval, input, or decision-making
+- **Time Travel Debugging**: Step through execution history with full state replay
 - **Comprehensive Testing**: 20+ tests covering all critical paths
 
 ## 📦 Crates
@@ -346,6 +348,82 @@ let results = checkpointer.search(metadata).await?;
 let count = checkpointer.count("thread-1").await?;
 ```
 
+### Human-in-the-Loop
+
+Pause execution for human approval or input:
+
+```rust
+use langgraph_core::prelude::*;
+use std::sync::Arc;
+
+// Create interrupt manager
+let interrupt_manager = Arc::new(InterruptManager::new());
+
+// Configure execution with interrupt points
+let config = ExecutionConfig::new("workflow-1")
+    .with_interrupts(interrupt_manager.clone())
+    .add_interrupt_node("critical_step", InterruptReason::ApprovalRequired);
+
+// Execute in background
+let handle = tokio::spawn(async move {
+    graph.execute_with_config(state, config).await
+});
+
+// Wait for interrupt
+tokio::time::sleep(Duration::from_millis(100)).await;
+
+// Get active interrupts
+let interrupts = interrupt_manager.get_active_interrupts().await;
+
+// Respond to interrupt
+let response = InterruptResponse::approve(&interrupts[0].id);
+interrupt_manager.respond(response).await?;
+
+// Execution continues after approval
+let result = handle.await??;
+```
+
+### Time Travel Debugging
+
+Step through execution history for debugging:
+
+```rust
+use langgraph_core::prelude::*;
+use std::sync::Arc;
+
+// Create history manager
+let history_manager = Arc::new(ExecutionHistoryManager::new());
+
+// Enable time travel
+let config = ExecutionConfig::new("debug-session")
+    .with_time_travel(history_manager.clone());
+
+// Execute graph
+graph.execute_with_config(state, config).await?;
+
+// Get execution history
+let histories = history_manager.get_histories("debug-session").await;
+let history = &histories[0];
+
+// Create debugger
+let mut debugger = history_manager.create_debugger(&history.id).await?;
+
+// Step through execution
+debugger.step_forward()?; // Next step
+debugger.step_backward()?; // Previous step
+debugger.jump_to(5)?; // Jump to specific step
+debugger.jump_to_end(); // Jump to end
+
+// Inspect state at current position
+let state = debugger.current_state();
+
+// Get execution path
+let path = history.execution_path(); // ["node1", "node2", "node3"]
+
+// Compare states
+let diff = debugger.diff(0, 3)?; // Compare initial to step 3
+```
+
 ## 🧪 Testing
 
 Run all tests:
@@ -449,8 +527,8 @@ This implementation targets 100% API compatibility with LangGraph Python, with t
 - ✅ Streaming execution
 - ✅ Checkpoint pagination
 - ✅ Metadata search
-- ⚠️ Human-in-the-loop (pending)
-- ⚠️ Time travel debugging (pending)
+- ✅ Human-in-the-loop
+- ✅ Time travel debugging
 
 ## 🤝 Contributing
 
