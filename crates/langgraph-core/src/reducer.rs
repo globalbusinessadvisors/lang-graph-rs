@@ -1,6 +1,6 @@
 //! State reduction and aggregation logic
 
-use crate::{Result, State};
+use crate::Result;
 use std::fmt::Debug;
 
 /// State aggregation and reduction trait

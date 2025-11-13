@@ -505,4 +505,73 @@ mod tests {
                 .unwrap();
         assert!(loaded.is_none());
     }
+
+    #[tokio::test]
+    async fn test_sqlite_checkpointer_search() {
+        let checkpointer = SqliteCheckpointer::in_memory().unwrap();
+        let state = TestState { value: 42 };
+        let checkpoint = Checkpoint::with_parent("thread-1", "parent-1", state);
+
+        <SqliteCheckpointer as Checkpointer<TestState>>::save(&checkpointer, checkpoint)
+            .await
+            .unwrap();
+
+        // Search by metadata
+        let mut filter = HashMap::new();
+        filter.insert("parent_id".to_string(), serde_json::json!("parent-1"));
+
+        let results =
+            <SqliteCheckpointer as Checkpointer<TestState>>::search(&checkpointer, "thread-1", filter)
+                .await
+                .unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_checkpointer_delete_thread() {
+        let checkpointer = SqliteCheckpointer::in_memory().unwrap();
+
+        // Create multiple checkpoints in the same thread
+        for i in 0..3 {
+            let state = TestState { value: i };
+            let checkpoint = Checkpoint::new("thread-1", state);
+            <SqliteCheckpointer as Checkpointer<TestState>>::save(&checkpointer, checkpoint)
+                .await
+                .unwrap();
+        }
+
+        // Verify they exist
+        let count =
+            <SqliteCheckpointer as Checkpointer<TestState>>::count(&checkpointer, "thread-1")
+                .await
+                .unwrap();
+        assert_eq!(count, 3);
+
+        // Delete entire thread
+        let deleted =
+            <SqliteCheckpointer as Checkpointer<TestState>>::delete_thread(&checkpointer, "thread-1")
+                .await
+                .unwrap();
+        assert_eq!(deleted, 3);
+
+        // Verify all deleted
+        let count =
+            <SqliteCheckpointer as Checkpointer<TestState>>::count(&checkpointer, "thread-1")
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_embedding_generation() {
+        let state = TestState { value: 42 };
+        let embedding = SqliteCheckpointer::generate_embedding(&state);
+
+        // Verify embedding properties
+        assert_eq!(embedding.len(), 384); // Should be 384 dimensions
+
+        // Verify normalization (magnitude should be ~1.0)
+        let magnitude: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((magnitude - 1.0).abs() < 0.01, "Embedding should be normalized");
+    }
 }

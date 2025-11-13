@@ -1,9 +1,8 @@
 //! Message types for MessageGraph
 
-use crate::{CompiledGraph, Error, Node, Result, State, StateGraph};
+use crate::{CompiledGraph, Node, Result, StateGraph};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Message role in a conversation
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -3,7 +3,7 @@
 use crate::{Checkpoint, CheckpointMetadata, Checkpointer};
 use async_trait::async_trait;
 use dashmap::DashMap;
-use langgraph_core::{Error, Result, State};
+use langgraph_core::{Result, State};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -1,6 +1,6 @@
 //! State schema definition and validation
 
-use crate::{Error, Result, State};
+use crate::{Error, Result};
 use serde_json::Value;
 use std::collections::HashMap;
 

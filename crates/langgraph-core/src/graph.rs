@@ -248,6 +248,7 @@ impl<S: State> Default for StateGraph<S> {
 /// Compiled and validated graph ready for execution
 pub struct CompiledGraph<S: State> {
     structure: Arc<GraphStructure<S>>,
+    #[allow(dead_code)] // Reserved for future streaming/caching features
     execution_cache: Arc<DashMap<String, Vec<String>>>,
 }
 
@@ -331,6 +332,15 @@ impl<S: State> CompiledGraph<S> {
         &self,
         state: S,
     ) -> Result<impl futures::Stream<Item = Result<(String, S)>>> {
+        self.stream_with_config(state, ExecutionConfig::default()).await
+    }
+
+    /// Stream execution with intermediate states and custom configuration
+    pub async fn stream_with_config(
+        &self,
+        state: S,
+        config: ExecutionConfig,
+    ) -> Result<impl futures::Stream<Item = Result<(String, S)>>> {
         use futures::stream;
 
         let entry = self
@@ -341,35 +351,66 @@ impl<S: State> CompiledGraph<S> {
             .clone();
 
         let structure = self.structure.clone();
+        let finish_point = self.structure.finish_point.clone();
 
         Ok(stream::unfold(
-            (state, Some(entry), HashSet::new()),
-            move |(mut state, current_opt, mut visited)| {
+            (state, Some(entry), HashSet::new(), 0usize),
+            move |(mut state, current_opt, mut visited, step_count)| {
                 let structure = structure.clone();
+                let finish_point = finish_point.clone();
+                let max_steps = config.max_steps;
                 async move {
                     let current = current_opt?;
+
+                    // Check max steps BEFORE executing
+                    if let Some(max) = max_steps {
+                        if step_count >= max {
+                            // Stop the stream - no more items
+                            return None;
+                        }
+                    }
                     visited.insert(current.clone());
 
                     // Get and execute node
                     let node = structure.nodes.get(&current)?;
-                    state = node.execute(state).await.ok()?;
+                    let state_backup = state.clone(); // Backup in case of error
+                    match node.execute(state).await {
+                        Ok(s) => {
+                            state = s;
+                        }
+                        Err(e) => {
+                            return Some((
+                                Err(Error::node_execution_failed(format!("Node '{}': {}", current, e))),
+                                (state_backup, None, visited, step_count)
+                            ));
+                        }
+                    }
 
                     let node_name = current.clone();
 
+                    // Check if we've reached the finish point
+                    let at_finish = finish_point.as_ref().map(|f| f == &current).unwrap_or(false);
+
                     // Determine next node
-                    let next = {
-                        let edges = structure.edges.get(&current)?;
+                    let next = if at_finish {
+                        None
+                    } else {
+                        let edges = structure.edges.get(&current);
                         let mut next_node = None;
 
-                        for edge in edges {
-                            match edge {
-                                EdgeType::Direct(to) => {
-                                    next_node = Some(to.clone());
-                                }
-                                EdgeType::Conditional { condition, edge_map } => {
-                                    let key = condition(&state);
-                                    if let Some(to) = edge_map.get(&key) {
+                        if let Some(edges) = edges {
+                            for edge in edges {
+                                match edge {
+                                    EdgeType::Direct(to) => {
                                         next_node = Some(to.clone());
+                                        break;
+                                    }
+                                    EdgeType::Conditional { condition, edge_map } => {
+                                        let key = condition(&state);
+                                        if let Some(to) = edge_map.get(&key) {
+                                            next_node = Some(to.clone());
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -377,7 +418,7 @@ impl<S: State> CompiledGraph<S> {
                         next_node
                     };
 
-                    Some((Ok((node_name, state.clone())), (state, next, visited)))
+                    Some((Ok((node_name, state.clone())), (state, next, visited, step_count + 1)))
                 }
             },
         ))
@@ -525,5 +566,163 @@ mod tests {
         let result = compiled.execute(state).await.unwrap();
 
         assert_eq!(result.value, 10);
+    }
+
+    #[tokio::test]
+    async fn test_stream_simple() {
+        use futures::{pin_mut, StreamExt};
+
+        let graph = StateGraph::new()
+            .add_node(
+                "increment",
+                FunctionNode::new("increment", |mut state: TestState| {
+                    Box::pin(async move {
+                        state.value += 1;
+                        Ok(state)
+                    })
+                }),
+            )
+            .add_node(
+                "double",
+                FunctionNode::new("double", |mut state: TestState| {
+                    Box::pin(async move {
+                        state.value *= 2;
+                        Ok(state)
+                    })
+                }),
+            )
+            .add_edge("increment", "double")
+            .set_entry_point("increment")
+            .set_finish_point("double");
+
+        let compiled = graph.compile().unwrap();
+        let state = TestState { value: 5 };
+        let stream = compiled.stream(state).await.unwrap();
+        pin_mut!(stream);
+
+        // First node: increment
+        let (node_name, state) = stream.next().await.unwrap().unwrap();
+        assert_eq!(node_name, "increment");
+        assert_eq!(state.value, 6);
+
+        // Second node: double
+        let (node_name, state) = stream.next().await.unwrap().unwrap();
+        assert_eq!(node_name, "double");
+        assert_eq!(state.value, 12);
+
+        // No more nodes
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stream_conditional() {
+        use futures::{pin_mut, StreamExt};
+
+        let mut edge_map = HashMap::new();
+        edge_map.insert("increment".to_string(), "increment".to_string());
+        edge_map.insert("done".to_string(), "finish".to_string());
+
+        let graph = StateGraph::new()
+            .add_node(
+                "increment",
+                FunctionNode::new("increment", |mut state: TestState| {
+                    Box::pin(async move {
+                        state.value += 1;
+                        Ok(state)
+                    })
+                }),
+            )
+            .add_node(
+                "finish",
+                FunctionNode::new("finish", |state: TestState| {
+                    Box::pin(async move { Ok(state) })
+                }),
+            )
+            .add_conditional_edge(
+                "increment",
+                |state: &TestState| {
+                    if state.value < 3 {
+                        "increment".to_string()
+                    } else {
+                        "done".to_string()
+                    }
+                },
+                edge_map,
+            )
+            .set_entry_point("increment")
+            .set_finish_point("finish");
+
+        let compiled = graph.compile().unwrap();
+        let state = TestState { value: 0 };
+        let stream = compiled.stream(state).await.unwrap();
+        pin_mut!(stream);
+
+        let results: Vec<_> = stream.collect().await;
+
+        // Should have 4 steps: increment (0->1), increment (1->2), increment (2->3), finish
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].as_ref().unwrap().0, "increment");
+        assert_eq!(results[0].as_ref().unwrap().1.value, 1);
+        assert_eq!(results[3].as_ref().unwrap().0, "finish");
+        assert_eq!(results[3].as_ref().unwrap().1.value, 3);
+    }
+
+    #[tokio::test]
+    async fn test_stream_with_max_steps() {
+        use futures::{pin_mut, StreamExt};
+
+        // Use conditional edge to create a loop (allowed by cycle detection)
+        let mut edge_map = HashMap::new();
+        edge_map.insert("continue".to_string(), "increment".to_string());
+        edge_map.insert("stop".to_string(), "finish".to_string());
+
+        let graph = StateGraph::new()
+            .add_node(
+                "increment",
+                FunctionNode::new("increment", |mut state: TestState| {
+                    Box::pin(async move {
+                        state.value += 1;
+                        Ok(state)
+                    })
+                }),
+            )
+            .add_node(
+                "finish",
+                FunctionNode::new("finish", |state: TestState| {
+                    Box::pin(async move { Ok(state) })
+                }),
+            )
+            .add_conditional_edge(
+                "increment",
+                |_state: &TestState| {
+                    // Always continue (infinite loop)
+                    "continue".to_string()
+                },
+                edge_map,
+            )
+            .set_entry_point("increment")
+            .set_finish_point("finish");
+
+        let compiled = graph.compile().unwrap();
+        let state = TestState { value: 0 };
+        let config = ExecutionConfig {
+            max_steps: Some(5),
+            debug: false,
+        };
+        let stream = compiled.stream_with_config(state, config).await.unwrap();
+        pin_mut!(stream);
+
+        let results: Vec<_> = stream.collect().await;
+
+        // Should execute exactly max_steps (5) then stop
+        assert_eq!(results.len(), 5, "Expected exactly 5 results, got {}", results.len());
+
+        // All 5 should be successful
+        for (i, result) in results.iter().enumerate() {
+            assert!(result.is_ok(), "Result {} should be ok, but got: {:?}", i, result);
+            if let Ok((name, _state)) = result {
+                assert_eq!(name, "increment", "All nodes should be 'increment'");
+            }
+        }
     }
 }

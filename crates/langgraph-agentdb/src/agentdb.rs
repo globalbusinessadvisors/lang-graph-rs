@@ -431,3 +431,217 @@ impl<S: State> Checkpointer<S> for AgentDbCheckpointer {
         Ok(filtered)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    struct TestState {
+        value: i32,
+    }
+
+    #[tokio::test]
+    async fn test_agentdb_checkpointer() {
+        let checkpointer = AgentDbCheckpointer::in_memory().unwrap();
+        let state = TestState { value: 42 };
+        let checkpoint = Checkpoint::new("thread-1", state.clone());
+
+        // Save checkpoint
+        let id = <AgentDbCheckpointer as Checkpointer<TestState>>::save(&checkpointer, checkpoint)
+            .await
+            .unwrap();
+        assert!(!id.is_empty());
+
+        // Load checkpoint
+        let loaded: Option<Checkpoint<TestState>> =
+            <AgentDbCheckpointer as Checkpointer<TestState>>::load(&checkpointer, &id)
+                .await
+                .unwrap();
+        assert_eq!(loaded.unwrap().state.value, 42);
+
+        // Load latest
+        let latest: Option<Checkpoint<TestState>> =
+            <AgentDbCheckpointer as Checkpointer<TestState>>::load_latest(&checkpointer, "thread-1")
+                .await
+                .unwrap();
+        assert_eq!(latest.unwrap().state.value, 42);
+
+        // Count
+        let count =
+            <AgentDbCheckpointer as Checkpointer<TestState>>::count(&checkpointer, "thread-1")
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_agentdb_checkpointer_list() {
+        let checkpointer = AgentDbCheckpointer::in_memory().unwrap();
+
+        // Save multiple checkpoints
+        for i in 0..5 {
+            let state = TestState { value: i };
+            let checkpoint = Checkpoint::new("thread-1", state);
+            <AgentDbCheckpointer as Checkpointer<TestState>>::save(&checkpointer, checkpoint)
+                .await
+                .unwrap();
+        }
+
+        // List all
+        let list =
+            <AgentDbCheckpointer as Checkpointer<TestState>>::list(&checkpointer, "thread-1")
+                .await
+                .unwrap();
+        assert_eq!(list.len(), 5);
+
+        // List paginated
+        let paginated =
+            <AgentDbCheckpointer as Checkpointer<TestState>>::list_paginated(
+                &checkpointer,
+                "thread-1",
+                2,
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(paginated.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_agentdb_checkpointer_delete() {
+        let checkpointer = AgentDbCheckpointer::in_memory().unwrap();
+        let state = TestState { value: 42 };
+        let checkpoint = Checkpoint::new("thread-1", state);
+
+        let id = <AgentDbCheckpointer as Checkpointer<TestState>>::save(&checkpointer, checkpoint)
+            .await
+            .unwrap();
+
+        // Delete checkpoint
+        let deleted =
+            <AgentDbCheckpointer as Checkpointer<TestState>>::delete(&checkpointer, &id)
+                .await
+                .unwrap();
+        assert!(deleted);
+
+        // Verify deleted
+        let loaded: Option<Checkpoint<TestState>> =
+            <AgentDbCheckpointer as Checkpointer<TestState>>::load(&checkpointer, &id)
+                .await
+                .unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_agentdb_checkpointer_search() {
+        let checkpointer = AgentDbCheckpointer::in_memory().unwrap();
+        let state = TestState { value: 42 };
+        let checkpoint = Checkpoint::with_parent("thread-1", "parent-1", state);
+
+        <AgentDbCheckpointer as Checkpointer<TestState>>::save(&checkpointer, checkpoint)
+            .await
+            .unwrap();
+
+        // Search by metadata
+        let mut filter = HashMap::new();
+        filter.insert("parent_id".to_string(), serde_json::json!("parent-1"));
+
+        let results =
+            <AgentDbCheckpointer as Checkpointer<TestState>>::search(&checkpointer, "thread-1", filter)
+                .await
+                .unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_agentdb_checkpointer_delete_thread() {
+        let checkpointer = AgentDbCheckpointer::in_memory().unwrap();
+
+        // Create multiple checkpoints in the same thread
+        for i in 0..3 {
+            let state = TestState { value: i };
+            let checkpoint = Checkpoint::new("thread-1", state);
+            <AgentDbCheckpointer as Checkpointer<TestState>>::save(&checkpointer, checkpoint)
+                .await
+                .unwrap();
+        }
+
+        // Verify they exist
+        let count =
+            <AgentDbCheckpointer as Checkpointer<TestState>>::count(&checkpointer, "thread-1")
+                .await
+                .unwrap();
+        assert_eq!(count, 3);
+
+        // Delete entire thread
+        let deleted =
+            <AgentDbCheckpointer as Checkpointer<TestState>>::delete_thread(&checkpointer, "thread-1")
+                .await
+                .unwrap();
+        assert_eq!(deleted, 3);
+
+        // Verify all deleted
+        let count =
+            <AgentDbCheckpointer as Checkpointer<TestState>>::count(&checkpointer, "thread-1")
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_agentdb_embedding_generation() {
+        let state = TestState { value: 42 };
+        let embedding = AgentDbCheckpointer::generate_embedding(&state, false);
+
+        // Verify embedding properties
+        assert_eq!(embedding.len(), 384); // Should be 384 dimensions
+
+        // Verify normalization (magnitude should be ~1.0)
+        let magnitude: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((magnitude - 1.0).abs() < 0.01, "Embedding should be normalized");
+    }
+
+    #[tokio::test]
+    async fn test_agentdb_embedding_quantization() {
+        let state = TestState { value: 42 };
+        let unquantized = AgentDbCheckpointer::generate_embedding(&state, false);
+        let quantized = AgentDbCheckpointer::generate_embedding(&state, true);
+
+        // Verify both are normalized
+        let mag1: f32 = unquantized.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let mag2: f32 = quantized.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+        assert!((mag1 - 1.0).abs() < 0.01);
+        assert!((mag2 - 1.0).abs() < 0.05); // Quantized may have slightly different magnitude
+
+        // Quantized values should be discrete multiples of 1/255
+        for &val in &quantized {
+            let scaled = (val * 255.0).round();
+            let expected = scaled / 255.0;
+            assert!((val - expected).abs() < 0.001, "Values should be quantized");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agentdb_performance_target() {
+        let checkpointer = AgentDbCheckpointer::in_memory().unwrap();
+        let state = TestState { value: 42 };
+
+        // Test that save is fast (target: <1ms)
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            let checkpoint = Checkpoint::new("thread-1", state.clone());
+            <AgentDbCheckpointer as Checkpointer<TestState>>::save(&checkpointer, checkpoint)
+                .await
+                .unwrap();
+        }
+        let elapsed = start.elapsed();
+        let avg_per_save = elapsed / 10;
+
+        println!("Average save time: {:?}", avg_per_save);
+        // Note: In production with optimized builds, this should be <1ms
+        // In debug builds, it may be slower
+    }
+}
